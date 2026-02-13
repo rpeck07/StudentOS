@@ -1,1 +1,1 @@
-.gitignore
+web: gunicorn app:app

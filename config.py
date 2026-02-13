@@ -1,15 +1,21 @@
 import os
 
 class Config:
-    SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me")
-    JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-only-change-me")
+    """
+    Central configuration for StudentOS.
 
-    # Render/Railway provide DATABASE_URL for Postgres
-    DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///studentos.db")
+    Uses environment variables in production (Render),
+    and safe fallbacks locally.
+    """
 
-    # Render sometimes uses postgres:// which SQLAlchemy wants as postgresql://
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    # Flask security key
+    # In production this MUST come from Render environment variables
+    SECRET_KEY = os.environ.get("SECRET_KEY", "dev_secret_key_change_me")
 
-    SQLALCHEMY_DATABASE_URI = DATABASE_URL
+    # Future database support (not required yet, but ready)
+    SQLALCHEMY_DATABASE_URI = os.environ.get(
+        "DATABASE_URL",
+        "sqlite:///studentos.db"  # local fallback
+    )
+
     SQLALCHEMY_TRACK_MODIFICATIONS = False
