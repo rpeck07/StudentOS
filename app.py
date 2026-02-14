@@ -2,7 +2,6 @@ from flask import Flask, render_template
 import os
 from datetime import date
 
-# If these imports fail on Render for any reason, the app should STILL start.
 ENGINE_OK = True
 try:
     from engine import (
@@ -20,6 +19,7 @@ DATA_FILE = os.path.join(os.path.dirname(__file__), "assignments.json")
 
 app = Flask(__name__)
 
+
 @app.get("/health")
 def health():
     return {
@@ -28,9 +28,9 @@ def health():
         "data_file_exists": os.path.exists(DATA_FILE),
     }, 200
 
+
 @app.get("/")
 def home():
-    # Always render something, even if engine or data fails.
     today = date.today()
 
     if not ENGINE_OK:
@@ -42,7 +42,6 @@ def home():
             200,
         )
 
-    # Load assignments (if missing, treat as empty)
     try:
         assignments = load_assignments(DATA_FILE) if os.path.exists(DATA_FILE) else []
     except Exception as e:
@@ -53,16 +52,19 @@ def home():
 
     danger_rows = rank_assignments_by_danger(assignments, today) if assignments else []
 
-    # Analytics (next 3 days) – keep safe if empty
+    # Analytics (next 3 days)
     try:
         bars = workload_text_bars(assignments, today, window_days=3) if assignments else []
-        total_next_3 = round(sum(x.get("hours", 0) for x in hours_next_days(assignments, today, 3)), 2) if assignments else 0
+        next3 = hours_next_days(assignments, today, 3) if assignments else []
+        total_next_3 = round(sum(x.get("hours", 0) for x in next3), 2)
     except Exception:
         bars = []
         total_next_3 = 0
 
-    # GPA impact – optional, only if you wire it in from the UI later
+    # GPA impact (optional)
     impacts = []
+    # If you want to use it later:
+    # impacts = gpa_impact_estimates(assignments, current_grade=90.0)
 
     return render_template(
         "index.html",
@@ -75,7 +77,7 @@ def home():
         impacts=impacts,
     )
 
+
 if __name__ == "__main__":
-    # Local dev only. Render ignores this and uses gunicorn.
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
