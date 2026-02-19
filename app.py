@@ -14,18 +14,17 @@ try:
         rank_assignments_by_danger,
         hours_next_days,
         workload_text_bars,
-        gpa_impact_estimates,  # optional
+        gpa_impact_estimates,
     )
 except Exception as e:
     ENGINE_OK = False
     ENGINE_IMPORT_ERROR = str(e)
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_FILE = os.path.join(BASE_DIR, "assignments.json")
+DATA_FILE = os.path.join(BASE_DIR, "assignments.json")  # fallback only
 
 app = Flask(__name__)
 
-# ✅ IMPORTANT: allow Content-Type + Authorization for Expo (web + mobile)
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -34,8 +33,18 @@ CORS(
 )
 
 # ----------------------------
-# Helpers (simple JSON storage)
+# Helpers
 # ----------------------------
+
+def _user_file(token: str) -> str:
+    """
+    FIX #1: Per-user data file so users can't overwrite each other.
+    Sanitize the token to make a safe filename.
+    """
+    safe = token.replace("/", "_").replace("..", "").replace(" ", "_")
+    return os.path.join(BASE_DIR, f"data_{safe}.json")
+
+
 def _read_json_file(path: str):
     if not os.path.exists(path):
         return []
@@ -45,24 +54,26 @@ def _read_json_file(path: str):
     except Exception:
         return []
 
+
 def _write_json_file(path: str, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
 
 def _require_token():
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
     token = auth.replace("Bearer ", "").strip()
-
-    # ✅ prevent accidental "Bearer undefined" / "Bearer null"
     if not token or token in ("undefined", "null"):
         return None
     return token
 
+
 # ----------------------------
-# Health + home (web page)
+# Health + home
 # ----------------------------
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -70,6 +81,7 @@ def health():
         "engine_ok": ENGINE_OK,
         "data_file_exists": os.path.exists(DATA_FILE),
     }), 200
+
 
 @app.get("/")
 def home():
@@ -95,13 +107,13 @@ def home():
     danger_rows = rank_assignments_by_danger(assignments, today) if assignments else []
 
     try:
-        # your engine uses days=window_days, not window_days=
-        bars = workload_text_bars(assignments, today, days=3) if assignments else []
-        nxt = hours_next_days(assignments, today, 3) if assignments else {"days": []}
+        # FIX #2: correct kwarg name is window_days, not days
+        bars = workload_text_bars(assignments, today, window_days=3) if assignments else []
 
-        total_next_3 = 0
-        if isinstance(nxt, dict) and isinstance(nxt.get("days"), list):
-            total_next_3 = round(sum(d.get("total_hours", 0) for d in nxt["days"]), 2)
+        # FIX #3: hours_next_days returns a LIST of {date, hours} dicts — not a dict with "days" key
+        nxt = hours_next_days(assignments, today, window_days=3) if assignments else []
+        total_next_3 = round(sum(d["hours"] for d in nxt), 2)
+
     except Exception:
         bars = []
         total_next_3 = 0
@@ -119,9 +131,11 @@ def home():
         impacts=impacts,
     )
 
+
 # ----------------------------
-# Debug endpoint (so clicks are never "silent")
+# Debug
 # ----------------------------
+
 @app.post("/debug")
 def debug():
     return jsonify({
@@ -131,9 +145,11 @@ def debug():
         "raw": request.data.decode("utf-8", errors="ignore"),
     }), 200
 
+
 # ----------------------------
-# API (Expo expects these)
+# Auth
 # ----------------------------
+
 @app.post("/register")
 def register():
     body = request.get_json(silent=True) or {}
@@ -144,6 +160,7 @@ def register():
         return jsonify({"error": "username and password required"}), 400
 
     return jsonify({"access_token": f"demo-{username}"}), 200
+
 
 @app.post("/login")
 def login():
@@ -156,14 +173,21 @@ def login():
 
     return jsonify({"access_token": f"demo-{username}"}), 200
 
+
+# ----------------------------
+# Assignments API
+# ----------------------------
+
 @app.get("/assignments")
 def get_assignments():
     token = _require_token()
     if not token:
         return jsonify({"error": "missing bearer token"}), 401
 
-    items = _read_json_file(DATA_FILE)
+    # FIX #1: read from this user's own file
+    items = _read_json_file(_user_file(token))
     return jsonify(items), 200
+
 
 @app.post("/assignments")
 def create_assignment():
@@ -192,11 +216,14 @@ def create_assignment():
         "createdAt": int(time.time() * 1000),
     }
 
-    items = _read_json_file(DATA_FILE)
+    # FIX #1: write to this user's own file
+    path = _user_file(token)
+    items = _read_json_file(path)
     items.append(item)
-    _write_json_file(DATA_FILE, items)
+    _write_json_file(path, items)
 
     return jsonify(item), 200
+
 
 @app.delete("/assignments/<id>")
 def delete_assignment(id):
@@ -204,10 +231,13 @@ def delete_assignment(id):
     if not token:
         return jsonify({"error": "missing bearer token"}), 401
 
-    items = _read_json_file(DATA_FILE)
+    # FIX #1: delete from this user's own file
+    path = _user_file(token)
+    items = _read_json_file(path)
     new_items = [x for x in items if str(x.get("id")) != str(id)]
-    _write_json_file(DATA_FILE, new_items)
+    _write_json_file(path, new_items)
     return "", 204
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))

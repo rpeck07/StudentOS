@@ -1,7 +1,3 @@
 flask
 gunicorn
-flask-sqlalchemy
-flask-jwt-extended
-flask-limiter
 flask-cors
-psycopg2-binary
