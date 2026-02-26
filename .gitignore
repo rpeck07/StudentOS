@@ -3,3 +3,4 @@ __pycache__/
 .env
 studentos.db
 assignments.json
+data_*.json

@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager,
@@ -9,17 +9,17 @@ from flask_jwt_extended import (
 )
 import bcrypt
 import os
-import json
+import sqlite3
 import time
 from uuid import uuid4
 from datetime import date, timedelta
 
 ENGINE_OK = True
+ENGINE_IMPORT_ERROR = ""
 try:
     from engine import (
         Assignment,
         parse_date,
-        load_assignments,
         rank_assignments_by_danger,
         hours_next_days,
         workload_text_bars,
@@ -31,10 +31,9 @@ except Exception as e:
     ENGINE_IMPORT_ERROR = str(e)
 
 BASE_DIR = os.path.dirname(__file__)
-USERS_FILE = os.path.join(BASE_DIR, "users.json")
+DB_PATH = os.path.join(BASE_DIR, "studentos.db")
 
 app = Flask(__name__)
-
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "dev-secret-change-me")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=30)
 
@@ -49,111 +48,108 @@ CORS(
 
 
 # ----------------------------
+# DB Setup
+# ----------------------------
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username   TEXT PRIMARY KEY,
+                password   TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS assignments (
+                id             TEXT PRIMARY KEY,
+                username       TEXT NOT NULL,
+                name           TEXT NOT NULL,
+                weight_percent REAL NOT NULL DEFAULT 0,
+                due_date       TEXT NOT NULL DEFAULT '',
+                confidence     INTEGER NOT NULL DEFAULT 3,
+                est_hours      REAL NOT NULL DEFAULT 0,
+                hours_logged   REAL NOT NULL DEFAULT 0,
+                created_at     INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                username      TEXT PRIMARY KEY,
+                current_grade REAL NOT NULL DEFAULT 85.0
+            )
+        """)
+        # Migration: add hours_logged column if it doesn't exist yet
+        try:
+            conn.execute("ALTER TABLE assignments ADD COLUMN hours_logged REAL NOT NULL DEFAULT 0")
+        except Exception:
+            pass  # column already exists
+        conn.commit()
+
+
+init_db()
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 
-def _read_users() -> dict:
-    if not os.path.exists(USERS_FILE):
-        return {}
-    try:
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _write_users(users: dict) -> None:
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
-
-
-def _user_data_file(username: str) -> str:
-    safe = username.replace("/", "_").replace("..", "").replace(" ", "_")
-    return os.path.join(BASE_DIR, f"data_{safe}.json")
-
-
-def _read_json_file(path: str):
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def _write_json_file(path: str, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
 def _load_user_assignments(username: str):
-    """Load a user's assignments from JSON and convert to engine Assignment objects."""
-    raw = _read_json_file(_user_data_file(username))
+    """Load a user's assignments from DB and convert to engine Assignment objects."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM assignments WHERE username = ? ORDER BY created_at DESC",
+            (username,)
+        ).fetchall()
+
     assignments = []
-    for x in raw:
+    for row in rows:
         try:
+            # Subtract hours already logged from remaining estimated hours
+            remaining = max(0.0, float(row["est_hours"]) - float(row["hours_logged"]))
             assignments.append(Assignment(
-                name=str(x["name"]),
-                weight_percent=float(x["weightPercent"]),
-                due_date=parse_date(str(x["dueDate"])),
-                confidence=int(x["confidence"]),
-                estimated_hours=float(x["estHours"]),
+                name=str(row["name"]),
+                weight_percent=float(row["weight_percent"]),
+                due_date=parse_date(str(row["due_date"])),
+                confidence=int(row["confidence"]),
+                estimated_hours=remaining,
             ))
         except Exception:
             pass
     return assignments
 
 
+def _get_user_grade(username: str) -> float:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT current_grade FROM user_settings WHERE username = ?",
+            (username,)
+        ).fetchone()
+    return float(row["current_grade"]) if row else 85.0
+
+
+def _set_user_grade(username: str, grade: float):
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO user_settings (username, current_grade)
+            VALUES (?, ?)
+            ON CONFLICT(username) DO UPDATE SET current_grade = excluded.current_grade
+        """, (username, grade))
+        conn.commit()
+
+
 # ----------------------------
-# Health + home
+# Health
 # ----------------------------
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "engine_ok": ENGINE_OK,
-    }), 200
-
-
-@app.get("/")
-def home():
-    today = date.today()
-
-    if not ENGINE_OK:
-        return (
-            f"<h1>StudentOS is running ✅</h1>"
-            f"<p>Engine import failed:</p>"
-            f"<pre>{ENGINE_IMPORT_ERROR}</pre>",
-            200,
-        )
-
-    try:
-        assignments = load_assignments(os.path.join(BASE_DIR, "assignments.json"))
-    except Exception:
-        assignments = []
-
-    danger_rows = rank_assignments_by_danger(assignments, today) if assignments else []
-
-    try:
-        bars = workload_text_bars(assignments, today, window_days=3) if assignments else []
-        nxt = hours_next_days(assignments, today, window_days=3) if assignments else []
-        total_next_3 = round(sum(d["hours"] for d in nxt), 2)
-    except Exception:
-        bars = []
-        total_next_3 = 0
-
-    return render_template(
-        "index.html",
-        engine_ok=True,
-        load_error=None,
-        assignments_count=len(assignments),
-        danger_rows=danger_rows,
-        bars=bars,
-        total_next_3=total_next_3,
-        impacts=[],
-    )
+    return jsonify({"ok": True, "engine_ok": ENGINE_OK}), 200
 
 
 # ----------------------------
@@ -173,13 +169,19 @@ def register():
     if len(password) < 6:
         return jsonify({"error": "password must be at least 6 characters"}), 400
 
-    users = _read_users()
-    if username in users:
-        return jsonify({"error": "username already taken"}), 409
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT username FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing:
+            return jsonify({"error": "username already taken"}), 409
 
-    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-    users[username] = hashed.decode("utf-8")
-    _write_users(users)
+        hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+        conn.execute(
+            "INSERT INTO users (username, password) VALUES (?, ?)",
+            (username, hashed.decode("utf-8"))
+        )
+        conn.commit()
 
     access_token = create_access_token(identity=username)
     return jsonify({"access_token": access_token}), 200
@@ -194,12 +196,14 @@ def login():
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
 
-    users = _read_users()
-    if username not in users:
-        return jsonify({"error": "invalid username or password"}), 401
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT password FROM users WHERE username = ?", (username,)
+        ).fetchone()
 
-    stored_hash = users[username].encode("utf-8")
-    if not bcrypt.checkpw(password.encode("utf-8"), stored_hash):
+    if not row:
+        return jsonify({"error": "invalid username or password"}), 401
+    if not bcrypt.checkpw(password.encode("utf-8"), row["password"].encode("utf-8")):
         return jsonify({"error": "invalid username or password"}), 401
 
     access_token = create_access_token(identity=username)
@@ -207,19 +211,19 @@ def login():
 
 
 # ----------------------------
-# Dashboard (NEW)
+# Dashboard
 # ----------------------------
 
 @app.get("/dashboard")
 @jwt_required()
 def get_dashboard():
     if not ENGINE_OK:
-        return jsonify({"error": "engine not available"}), 500
+        return jsonify({"error": "engine not available", "detail": ENGINE_IMPORT_ERROR}), 500
 
     username = get_jwt_identity()
     today = date.today()
-
     assignments = _load_user_assignments(username)
+    current_grade = _get_user_grade(username)
 
     if not assignments:
         return jsonify({
@@ -234,10 +238,11 @@ def get_dashboard():
             },
             "gpa_impacts": [],
             "workload_next_3_days": [],
+            "current_grade": current_grade,
         }), 200
 
     summary = dashboard_summary(assignments, today)
-    gpa = gpa_impact_estimates(assignments, current_grade=85.0)
+    gpa = gpa_impact_estimates(assignments, current_grade=current_grade)
     workload = hours_next_days(assignments, today, window_days=3)
 
     return jsonify({
@@ -247,6 +252,7 @@ def get_dashboard():
         "stress_forecast": summary["stress_forecast"],
         "gpa_impacts": gpa,
         "workload_next_3_days": workload,
+        "current_grade": current_grade,
     }), 200
 
 
@@ -258,8 +264,27 @@ def get_dashboard():
 @jwt_required()
 def get_assignments():
     username = get_jwt_identity()
-    items = _read_json_file(_user_data_file(username))
-    return jsonify(items), 200
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM assignments WHERE username = ? ORDER BY created_at DESC",
+            (username,)
+        ).fetchall()
+
+    items = [dict(row) for row in rows]
+    # Rename DB columns to camelCase for the frontend
+    result = []
+    for x in items:
+        result.append({
+            "id": x["id"],
+            "name": x["name"],
+            "weightPercent": x["weight_percent"],
+            "dueDate": x["due_date"],
+            "confidence": x["confidence"],
+            "estHours": x["est_hours"],
+            "hoursLogged": x["hours_logged"],
+            "createdAt": x["created_at"],
+        })
+    return jsonify(result), 200
 
 
 @app.post("/assignments")
@@ -269,50 +294,104 @@ def create_assignment():
     body = request.get_json(silent=True) or {}
 
     name = str(body.get("name", "")).strip()
-    weightPercent = body.get("weightPercent")
-    dueDate = body.get("dueDate")
-    confidence = body.get("confidence")
-    estHours = body.get("estHours")
-
     if not name:
         return jsonify({"error": "name required"}), 400
 
-    item = {
-        "id": str(uuid4()),
+    item_id = str(uuid4())
+    weight_percent = float(body.get("weightPercent", 0))
+    due_date = str(body.get("dueDate", ""))
+    confidence = int(body.get("confidence", 3))
+    est_hours = float(body.get("estHours", 0))
+    created_at = int(time.time() * 1000)
+
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO assignments
+                (id, username, name, weight_percent, due_date, confidence, est_hours, hours_logged, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """, (item_id, username, name, weight_percent, due_date, confidence, est_hours, created_at))
+        conn.commit()
+
+    return jsonify({
+        "id": item_id,
         "name": name,
-        "weightPercent": float(weightPercent or 0),
-        "dueDate": str(dueDate or ""),
-        "confidence": int(confidence or 3),
-        "estHours": float(estHours or 0),
-        "createdAt": int(time.time() * 1000),
-    }
-
-    path = _user_data_file(username)
-    items = _read_json_file(path)
-    items.append(item)
-    _write_json_file(path, items)
-
-    return jsonify(item), 200
+        "weightPercent": weight_percent,
+        "dueDate": due_date,
+        "confidence": confidence,
+        "estHours": est_hours,
+        "hoursLogged": 0,
+        "createdAt": created_at,
+    }), 200
 
 
 @app.delete("/assignments/<id>")
 @jwt_required()
 def delete_assignment(id):
     username = get_jwt_identity()
-    path = _user_data_file(username)
-    items = _read_json_file(path)
-    new_items = [x for x in items if str(x.get("id")) != str(id)]
-    _write_json_file(path, new_items)
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM assignments WHERE id = ? AND username = ?",
+            (id, username)
+        )
+        conn.commit()
     return "", 204
 
 
-@app.post("/debug")
-def debug():
-    return jsonify({
-        "ok": True,
-        "headers": dict(request.headers),
-        "json": request.get_json(silent=True),
-    }), 200
+@app.post("/assignments/<id>/log-hours")
+@jwt_required()
+def log_hours(id):
+    """Log hours worked on an assignment. Reduces remaining hours in projections."""
+    username = get_jwt_identity()
+    body = request.get_json(silent=True) or {}
+    hours = float(body.get("hours", 0))
+
+    if hours <= 0:
+        return jsonify({"error": "hours must be > 0"}), 400
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT est_hours, hours_logged FROM assignments WHERE id = ? AND username = ?",
+            (id, username)
+        ).fetchone()
+
+        if not row:
+            return jsonify({"error": "assignment not found"}), 404
+
+        new_logged = float(row["hours_logged"]) + hours
+        conn.execute(
+            "UPDATE assignments SET hours_logged = ? WHERE id = ? AND username = ?",
+            (new_logged, id, username)
+        )
+        conn.commit()
+
+    return jsonify({"hours_logged": new_logged}), 200
+
+
+# ----------------------------
+# Settings (per-user grade)
+# ----------------------------
+
+@app.get("/settings")
+@jwt_required()
+def get_settings():
+    username = get_jwt_identity()
+    grade = _get_user_grade(username)
+    return jsonify({"current_grade": grade}), 200
+
+
+@app.post("/settings")
+@jwt_required()
+def update_settings():
+    username = get_jwt_identity()
+    body = request.get_json(silent=True) or {}
+
+    if "current_grade" in body:
+        grade = float(body["current_grade"])
+        if not (0 <= grade <= 100):
+            return jsonify({"error": "current_grade must be 0–100"}), 400
+        _set_user_grade(username, grade)
+
+    return jsonify({"current_grade": _get_user_grade(username)}), 200
 
 
 if __name__ == "__main__":
