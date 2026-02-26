@@ -66,29 +66,49 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS courses (
+                id         TEXT PRIMARY KEY,
+                username   TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                color      TEXT NOT NULL DEFAULT '#4f7cff',
+                created_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS assignments (
                 id             TEXT PRIMARY KEY,
                 username       TEXT NOT NULL,
                 name           TEXT NOT NULL,
+                course_id      TEXT DEFAULT NULL,
                 weight_percent REAL NOT NULL DEFAULT 0,
                 due_date       TEXT NOT NULL DEFAULT '',
                 confidence     INTEGER NOT NULL DEFAULT 3,
                 est_hours      REAL NOT NULL DEFAULT 0,
                 hours_logged   REAL NOT NULL DEFAULT 0,
+                completed      INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL DEFAULT 0
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
-                username      TEXT PRIMARY KEY,
-                current_grade REAL NOT NULL DEFAULT 85.0
+                username         TEXT PRIMARY KEY,
+                current_grade    REAL NOT NULL DEFAULT 85.0,
+                onboarded        INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # Migration: add hours_logged column if it doesn't exist yet
-        try:
-            conn.execute("ALTER TABLE assignments ADD COLUMN hours_logged REAL NOT NULL DEFAULT 0")
-        except Exception:
-            pass  # column already exists
+
+        # Migrations
+        for migration in [
+            "ALTER TABLE assignments ADD COLUMN hours_logged REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE assignments ADD COLUMN completed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE assignments ADD COLUMN course_id TEXT DEFAULT NULL",
+            "ALTER TABLE user_settings ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 0",
+        ]:
+            try:
+                conn.execute(migration)
+            except Exception:
+                pass
+
         conn.commit()
 
 
@@ -100,17 +120,15 @@ init_db()
 # ----------------------------
 
 def _load_user_assignments(username: str):
-    """Load a user's assignments from DB and convert to engine Assignment objects."""
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM assignments WHERE username = ? ORDER BY created_at DESC",
+            "SELECT * FROM assignments WHERE username = ? AND completed = 0 ORDER BY created_at DESC",
             (username,)
         ).fetchall()
 
     assignments = []
     for row in rows:
         try:
-            # Subtract hours already logged from remaining estimated hours
             remaining = max(0.0, float(row["est_hours"]) - float(row["hours_logged"]))
             assignments.append(Assignment(
                 name=str(row["name"]),
@@ -141,6 +159,15 @@ def _set_user_grade(username: str, grade: float):
             ON CONFLICT(username) DO UPDATE SET current_grade = excluded.current_grade
         """, (username, grade))
         conn.commit()
+
+
+def _get_onboarded(username: str) -> bool:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT onboarded FROM user_settings WHERE username = ?",
+            (username,)
+        ).fetchone()
+    return bool(row["onboarded"]) if row else False
 
 
 # ----------------------------
@@ -257,6 +284,62 @@ def get_dashboard():
 
 
 # ----------------------------
+# Courses API
+# ----------------------------
+
+@app.get("/courses")
+@jwt_required()
+def get_courses():
+    username = get_jwt_identity()
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM courses WHERE username = ? ORDER BY created_at ASC",
+            (username,)
+        ).fetchall()
+    return jsonify([dict(r) for r in rows]), 200
+
+
+@app.post("/courses")
+@jwt_required()
+def create_course():
+    username = get_jwt_identity()
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name", "")).strip()
+    color = str(body.get("color", "#4f7cff"))
+
+    if not name:
+        return jsonify({"error": "name required"}), 400
+
+    course_id = str(uuid4())
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO courses (id, username, name, color, created_at) VALUES (?, ?, ?, ?, ?)",
+            (course_id, username, name, color, int(time.time() * 1000))
+        )
+        conn.commit()
+
+    return jsonify({"id": course_id, "name": name, "color": color}), 200
+
+
+@app.delete("/courses/<id>")
+@jwt_required()
+def delete_course(id):
+    username = get_jwt_identity()
+    with get_db() as conn:
+        # Unlink assignments from this course
+        conn.execute(
+            "UPDATE assignments SET course_id = NULL WHERE course_id = ? AND username = ?",
+            (id, username)
+        )
+        conn.execute(
+            "DELETE FROM courses WHERE id = ? AND username = ?",
+            (id, username)
+        )
+        conn.commit()
+    return "", 204
+
+
+# ----------------------------
 # Assignments API
 # ----------------------------
 
@@ -270,18 +353,18 @@ def get_assignments():
             (username,)
         ).fetchall()
 
-    items = [dict(row) for row in rows]
-    # Rename DB columns to camelCase for the frontend
     result = []
-    for x in items:
+    for x in [dict(r) for r in rows]:
         result.append({
             "id": x["id"],
             "name": x["name"],
+            "courseId": x.get("course_id"),
             "weightPercent": x["weight_percent"],
             "dueDate": x["due_date"],
             "confidence": x["confidence"],
             "estHours": x["est_hours"],
             "hoursLogged": x["hours_logged"],
+            "completed": bool(x.get("completed", 0)),
             "createdAt": x["created_at"],
         })
     return jsonify(result), 200
@@ -302,24 +385,27 @@ def create_assignment():
     due_date = str(body.get("dueDate", ""))
     confidence = int(body.get("confidence", 3))
     est_hours = float(body.get("estHours", 0))
+    course_id = body.get("courseId") or None
     created_at = int(time.time() * 1000)
 
     with get_db() as conn:
         conn.execute("""
             INSERT INTO assignments
-                (id, username, name, weight_percent, due_date, confidence, est_hours, hours_logged, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-        """, (item_id, username, name, weight_percent, due_date, confidence, est_hours, created_at))
+                (id, username, name, course_id, weight_percent, due_date, confidence, est_hours, hours_logged, completed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+        """, (item_id, username, name, course_id, weight_percent, due_date, confidence, est_hours, created_at))
         conn.commit()
 
     return jsonify({
         "id": item_id,
         "name": name,
+        "courseId": course_id,
         "weightPercent": weight_percent,
         "dueDate": due_date,
         "confidence": confidence,
         "estHours": est_hours,
         "hoursLogged": 0,
+        "completed": False,
         "createdAt": created_at,
     }), 200
 
@@ -336,6 +422,9 @@ def update_assignment(id):
     if "name" in body:
         fields.append("name = ?")
         values.append(str(body["name"]).strip())
+    if "courseId" in body:
+        fields.append("course_id = ?")
+        values.append(body["courseId"] or None)
     if "weightPercent" in body:
         fields.append("weight_percent = ?")
         values.append(float(body["weightPercent"]))
@@ -353,7 +442,6 @@ def update_assignment(id):
         return jsonify({"error": "nothing to update"}), 400
 
     values.extend([id, username])
-
     with get_db() as conn:
         conn.execute(
             f"UPDATE assignments SET {', '.join(fields)} WHERE id = ? AND username = ?",
@@ -364,23 +452,22 @@ def update_assignment(id):
     return jsonify({"ok": True}), 200
 
 
-@app.delete("/assignments/<id>")
+@app.post("/assignments/<id>/complete")
 @jwt_required()
-def delete_assignment(id):
+def complete_assignment(id):
     username = get_jwt_identity()
     with get_db() as conn:
         conn.execute(
-            "DELETE FROM assignments WHERE id = ? AND username = ?",
+            "UPDATE assignments SET completed = 1 WHERE id = ? AND username = ?",
             (id, username)
         )
         conn.commit()
-    return "", 204
+    return jsonify({"ok": True}), 200
 
 
 @app.post("/assignments/<id>/log-hours")
 @jwt_required()
 def log_hours(id):
-    """Log hours worked on an assignment. Reduces remaining hours in projections."""
     username = get_jwt_identity()
     body = request.get_json(silent=True) or {}
     hours = float(body.get("hours", 0))
@@ -407,8 +494,21 @@ def log_hours(id):
     return jsonify({"hours_logged": new_logged}), 200
 
 
+@app.delete("/assignments/<id>")
+@jwt_required()
+def delete_assignment(id):
+    username = get_jwt_identity()
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM assignments WHERE id = ? AND username = ?",
+            (id, username)
+        )
+        conn.commit()
+    return "", 204
+
+
 # ----------------------------
-# Settings (per-user grade)
+# Settings
 # ----------------------------
 
 @app.get("/settings")
@@ -416,7 +516,8 @@ def log_hours(id):
 def get_settings():
     username = get_jwt_identity()
     grade = _get_user_grade(username)
-    return jsonify({"current_grade": grade}), 200
+    onboarded = _get_onboarded(username)
+    return jsonify({"current_grade": grade, "onboarded": onboarded}), 200
 
 
 @app.post("/settings")
@@ -425,13 +526,35 @@ def update_settings():
     username = get_jwt_identity()
     body = request.get_json(silent=True) or {}
 
-    if "current_grade" in body:
-        grade = float(body["current_grade"])
-        if not (0 <= grade <= 100):
-            return jsonify({"error": "current_grade must be 0–100"}), 400
-        _set_user_grade(username, grade)
+    with get_db() as conn:
+        # Ensure row exists
+        conn.execute("""
+            INSERT INTO user_settings (username, current_grade, onboarded)
+            VALUES (?, 85.0, 0)
+            ON CONFLICT(username) DO NOTHING
+        """, (username,))
 
-    return jsonify({"current_grade": _get_user_grade(username)}), 200
+        if "current_grade" in body:
+            grade = float(body["current_grade"])
+            if not (0 <= grade <= 100):
+                return jsonify({"error": "current_grade must be 0–100"}), 400
+            conn.execute(
+                "UPDATE user_settings SET current_grade = ? WHERE username = ?",
+                (grade, username)
+            )
+
+        if "onboarded" in body:
+            conn.execute(
+                "UPDATE user_settings SET onboarded = ? WHERE username = ?",
+                (1 if body["onboarded"] else 0, username)
+            )
+
+        conn.commit()
+
+    return jsonify({
+        "current_grade": _get_user_grade(username),
+        "onboarded": _get_onboarded(username),
+    }), 200
 
 
 if __name__ == "__main__":
