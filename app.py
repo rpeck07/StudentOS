@@ -43,7 +43,7 @@ CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "DELETE", "OPTIONS"],
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
 )
 
 
@@ -322,6 +322,46 @@ def create_assignment():
         "hoursLogged": 0,
         "createdAt": created_at,
     }), 200
+
+
+@app.patch("/assignments/<id>")
+@jwt_required()
+def update_assignment(id):
+    username = get_jwt_identity()
+    body = request.get_json(silent=True) or {}
+
+    fields = []
+    values = []
+
+    if "name" in body:
+        fields.append("name = ?")
+        values.append(str(body["name"]).strip())
+    if "weightPercent" in body:
+        fields.append("weight_percent = ?")
+        values.append(float(body["weightPercent"]))
+    if "dueDate" in body:
+        fields.append("due_date = ?")
+        values.append(str(body["dueDate"]))
+    if "confidence" in body:
+        fields.append("confidence = ?")
+        values.append(int(body["confidence"]))
+    if "estHours" in body:
+        fields.append("est_hours = ?")
+        values.append(float(body["estHours"]))
+
+    if not fields:
+        return jsonify({"error": "nothing to update"}), 400
+
+    values.extend([id, username])
+
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE assignments SET {', '.join(fields)} WHERE id = ? AND username = ?",
+            values
+        )
+        conn.commit()
+
+    return jsonify({"ok": True}), 200
 
 
 @app.delete("/assignments/<id>")
